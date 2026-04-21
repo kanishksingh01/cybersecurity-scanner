@@ -1,228 +1,334 @@
-import { NextRequest, NextResponse } from "next/server";
-import * as tls from "tls";
-import * as dns from "dns/promises";
-import type { HeadersResult, SSLResult, DNSResult, ScanResult } from "@/app/types";
+import { NextResponse } from "next/server";
+import { exec as execCb } from "child_process";
+import { promisify } from "util";
+import { readFile, stat } from "fs/promises";
+import type {
+  ScanResult,
+  OpenPort,
+  SSHConfig,
+  FirewallConfig,
+  SystemUpdate,
+  RunningService,
+  FilePermission,
+} from "@/app/types";
+import { ScanRiskLevel, PortState, ServiceState } from "@/app/types";
 
-const SECURITY_HEADERS = [
-  "strict-transport-security",
-  "content-security-policy",
-  "x-frame-options",
-  "x-content-type-options",
-  "x-xss-protection",
-  "referrer-policy",
-  "permissions-policy",
+const exec = promisify(execCb);
+
+async function run(cmd: string): Promise<string> {
+  try {
+    const { stdout } = await exec(cmd, { timeout: 5000 });
+    return stdout.trim();
+  } catch {
+    return "";
+  }
+}
+
+const RISKY_PORTS = new Set([21, 23, 25, 110, 143, 445, 3306, 5432, 6379, 27017]);
+
+async function scanPorts(): Promise<OpenPort[]> {
+  const output = await run("ss -tlnp 2>/dev/null");
+  if (!output) return [];
+
+  const ports: OpenPort[] = [];
+  const lines = output.split("\n").slice(1);
+
+  for (const line of lines) {
+    const parts = line.split(/\s+/);
+    if (parts.length < 5) continue;
+
+    const localAddr = parts[3];
+    const portStr = localAddr.split(":").pop();
+    if (!portStr) continue;
+
+    const portNumber = parseInt(portStr, 10);
+    if (isNaN(portNumber)) continue;
+
+    const processMatch = line.match(/users:\(\("([^"]+)"/);
+    const serviceName = processMatch?.[1] || "unknown";
+
+    const isRisky = RISKY_PORTS.has(portNumber);
+
+    ports.push({
+      portNumber,
+      serviceName,
+      state: PortState.Open,
+      riskLevel: isRisky ? ScanRiskLevel.High : ScanRiskLevel.Low,
+      description: isRisky ? `Port ${portNumber} is commonly targeted` : undefined,
+    });
+  }
+
+  return ports;
+}
+
+async function scanSSH(): Promise<SSHConfig> {
+  const defaults: SSHConfig = {
+    passwordAuthEnabled: true,
+    rootLoginAllowed: false,
+    keyBasedAuthAvailable: true,
+    protocolVersion: "2",
+    riskItems: [],
+  };
+
+  let content: string;
+  try {
+    content = await readFile("/etc/ssh/sshd_config", "utf-8");
+  } catch {
+    defaults.riskItems.push("Could not read SSH config");
+    return defaults;
+  }
+
+  const lines = content.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+
+  for (const line of lines) {
+    const [key, ...rest] = line.split(/\s+/);
+    const val = rest.join(" ").toLowerCase();
+
+    if (key === "PasswordAuthentication") {
+      defaults.passwordAuthEnabled = val !== "no";
+    } else if (key === "PermitRootLogin") {
+      defaults.rootLoginAllowed = val === "yes";
+    } else if (key === "PubkeyAuthentication") {
+      defaults.keyBasedAuthAvailable = val !== "no";
+    } else if (key === "Protocol") {
+      defaults.protocolVersion = val;
+    }
+  }
+
+  if (defaults.passwordAuthEnabled) defaults.riskItems.push("Password authentication is enabled");
+  if (defaults.rootLoginAllowed) defaults.riskItems.push("Root login is allowed");
+  if (!defaults.keyBasedAuthAvailable) defaults.riskItems.push("Public key authentication is disabled");
+
+  return defaults;
+}
+
+async function scanFirewall(): Promise<FirewallConfig> {
+  const result: FirewallConfig = {
+    isActive: false,
+    defaultPolicies: { input: "UNKNOWN", output: "UNKNOWN", forward: "UNKNOWN" },
+    ruleCount: 0,
+    rulesList: [],
+  };
+
+  const ufwOutput = await run("sudo ufw status verbose 2>/dev/null");
+
+  if (ufwOutput.includes("Status: active")) {
+    result.isActive = true;
+    const defaultLine = ufwOutput.match(/Default:\s*(.+)/);
+    if (defaultLine) {
+      const policies = defaultLine[1];
+      if (policies.includes("deny (incoming)")) result.defaultPolicies.input = "DENY";
+      else if (policies.includes("allow (incoming)")) result.defaultPolicies.input = "ALLOW";
+      if (policies.includes("allow (outgoing)")) result.defaultPolicies.output = "ALLOW";
+      else if (policies.includes("deny (outgoing)")) result.defaultPolicies.output = "DENY";
+      if (policies.includes("deny (routed)")) result.defaultPolicies.forward = "DENY";
+      else if (policies.includes("allow (routed)")) result.defaultPolicies.forward = "ALLOW";
+    }
+
+    const ruleLines = ufwOutput.split("\n").filter((l) => l.match(/^\d+|^ALLOW|^DENY|^REJECT/i));
+    result.ruleCount = ruleLines.length;
+    result.rulesList = ruleLines.slice(0, 20).map((l) => ({
+      source: "any",
+      destination: l.split(/\s+/)[0] || "",
+      action: l.includes("ALLOW") ? "ALLOW" : l.includes("DENY") ? "DENY" : "REJECT",
+      description: l.trim(),
+    }));
+    return result;
+  }
+
+  const iptOutput = await run("sudo iptables -L -n --line-numbers 2>/dev/null");
+  if (iptOutput) {
+    result.isActive = true;
+    const inputPolicy = iptOutput.match(/Chain INPUT \(policy (\w+)\)/);
+    const outputPolicy = iptOutput.match(/Chain OUTPUT \(policy (\w+)\)/);
+    const forwardPolicy = iptOutput.match(/Chain FORWARD \(policy (\w+)\)/);
+    if (inputPolicy) result.defaultPolicies.input = inputPolicy[1];
+    if (outputPolicy) result.defaultPolicies.output = outputPolicy[1];
+    if (forwardPolicy) result.defaultPolicies.forward = forwardPolicy[1];
+
+    const ruleLines = iptOutput.split("\n").filter((l) => l.match(/^\d+/));
+    result.ruleCount = ruleLines.length;
+  }
+
+  return result;
+}
+
+async function scanUpdates(): Promise<SystemUpdate> {
+  const result: SystemUpdate = {
+    totalPackages: 0,
+    upgradableCount: 0,
+    criticalUpdatesAvailable: false,
+    packageList: [],
+  };
+
+  const totalOutput = await run("dpkg --list 2>/dev/null | grep '^ii' | wc -l");
+  result.totalPackages = parseInt(totalOutput, 10) || 0;
+
+  const output = await run("apt list --upgradable 2>/dev/null");
+  if (!output) return result;
+
+  const lines = output.split("\n").filter((l) => l && !l.startsWith("Listing"));
+  result.upgradableCount = lines.length;
+  result.packageList = lines.slice(0, 25).map((l) => l.split("/")[0]);
+
+  const critical = ["linux-image", "openssl", "openssh", "sudo", "systemd", "glibc", "libc6"];
+  result.criticalUpdatesAvailable = lines.some((l) =>
+    critical.some((c) => l.toLowerCase().includes(c))
+  );
+
+  return result;
+}
+
+const RISKY_SERVICES = new Set(["telnetd", "vsftpd", "proftpd", "rsh", "rlogin", "xinetd", "avahi-daemon"]);
+
+async function scanServices(): Promise<RunningService[]> {
+  const output = await run("systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null");
+  if (!output) return [];
+
+  const services: RunningService[] = [];
+
+  for (const line of output.split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 4) continue;
+
+    const name = parts[0].replace(".service", "");
+    const isRisky = RISKY_SERVICES.has(name);
+
+    services.push({
+      serviceName: name,
+      currentState: ServiceState.Running,
+      enabledAtBoot: true,
+      riskLevel: isRisky ? ScanRiskLevel.High : ScanRiskLevel.Low,
+      description: isRisky ? `${name} is a potentially insecure service` : undefined,
+    });
+  }
+
+  return services;
+}
+
+const SENSITIVE_FILES: Array<{ path: string; expected: string }> = [
+  { path: "/etc/passwd", expected: "644" },
+  { path: "/etc/shadow", expected: "640" },
+  { path: "/etc/ssh/sshd_config", expected: "600" },
+  { path: "/etc/gshadow", expected: "640" },
+  { path: "/etc/crontab", expected: "644" },
 ];
 
-function normalizeUrl(input: string): URL {
-  let raw = input.trim();
-  if (!/^https?:\/\//i.test(raw)) {
-    raw = "https://" + raw;
-  }
-  return new URL(raw);
-}
+async function scanFilePermissions(): Promise<FilePermission[]> {
+  const results: FilePermission[] = [];
 
-async function checkHeaders(url: URL): Promise<HeadersResult> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-
-  try {
-    const res = await fetch(url.toString(), {
-      method: "HEAD",
-      signal: controller.signal,
-      redirect: "follow",
-    });
-
-    const result: HeadersResult = {};
-    for (const name of SECURITY_HEADERS) {
-      const value = res.headers.get(name);
-      result[name] = { present: value !== null, value };
-    }
-    return result;
-  } catch {
-    const result: HeadersResult = {};
-    for (const name of SECURITY_HEADERS) {
-      result[name] = { present: false, value: null };
-    }
-    return result;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function checkSSL(hostname: string): Promise<SSLResult | null> {
-  return new Promise((resolve) => {
-    const socket = tls.connect(
-      { host: hostname, port: 443, servername: hostname, timeout: 5000 },
-      () => {
-        try {
-          const cert = socket.getPeerCertificate();
-          const protocol = socket.getProtocol() || "unknown";
-
-          if (!cert || !cert.subject) {
-            socket.destroy();
-            resolve(null);
-            return;
-          }
-
-          const validTo = new Date(cert.valid_to);
-          const daysUntilExpiry = Math.floor(
-            (validTo.getTime() - Date.now()) / (1000 * 60 * 60 * 24)
-          );
-
-          resolve({
-            issuer: String(cert.issuer?.O || cert.issuer?.CN || "Unknown"),
-            subject: String(cert.subject?.CN || "Unknown"),
-            validFrom: cert.valid_from,
-            validTo: cert.valid_to,
-            daysUntilExpiry,
-            protocol,
-          });
-        } catch {
-          resolve(null);
-        } finally {
-          socket.destroy();
-        }
-      }
-    );
-
-    socket.on("error", () => {
-      socket.destroy();
-      resolve(null);
-    });
-
-    socket.on("timeout", () => {
-      socket.destroy();
-      resolve(null);
-    });
-  });
-}
-
-async function checkDNS(hostname: string): Promise<DNSResult | null> {
-  const resolver = new dns.Resolver();
-  resolver.setServers(["8.8.8.8", "1.1.1.1"]);
-
-  const withTimeout = <T>(promise: Promise<T>, fallback: T): Promise<T> =>
-    Promise.race([
-      promise,
-      new Promise<T>((resolve) => setTimeout(() => resolve(fallback), 3000)),
-    ]);
-
-  try {
-    const [a, aaaa, mx, ns, txt] = await Promise.all([
-      withTimeout(resolver.resolve4(hostname).catch(() => []), []),
-      withTimeout(resolver.resolve6(hostname).catch(() => []), []),
-      withTimeout(resolver.resolveMx(hostname).catch(() => []), []),
-      withTimeout(resolver.resolveNs(hostname).catch(() => []), []),
-      withTimeout(resolver.resolveTxt(hostname).catch(() => []), []),
-    ]);
-
-    const flatTxt = txt.map((parts) => parts.join(""));
-    const hasSPF = flatTxt.some((t) => t.startsWith("v=spf1"));
-    const hasDMARC = await withTimeout(
-      resolver
-        .resolveTxt(`_dmarc.${hostname}`)
-        .then((records) =>
-          records.some((parts) => parts.join("").startsWith("v=DMARC1"))
-        )
-        .catch(() => false),
-      false
-    );
-
-    return {
-      a,
-      aaaa,
-      mx: mx.map((r) => ({ exchange: r.exchange, priority: r.priority })),
-      ns,
-      txt: flatTxt,
-      hasSPF,
-      hasDMARC,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function computeGrade(
-  headers: HeadersResult,
-  ssl: SSLResult | null,
-  dnsResult: DNSResult | null
-): { grade: string; score: number; maxScore: number } {
-  let score = 0;
-  const maxScore = 12;
-
-  for (const name of SECURITY_HEADERS) {
-    if (headers[name]?.present) score++;
-  }
-
-  if (ssl) {
-    score++;
-    if (ssl.daysUntilExpiry > 30) score++;
-    if (ssl.protocol && ssl.protocol >= "TLSv1.2") score++;
-  }
-
-  if (dnsResult) {
-    if (dnsResult.hasSPF) score++;
-    if (dnsResult.hasDMARC) score++;
-  }
-
-  let grade: string;
-  if (score >= 11) grade = "A";
-  else if (score >= 9) grade = "B";
-  else if (score >= 7) grade = "C";
-  else if (score >= 5) grade = "D";
-  else grade = "F";
-
-  return { grade, score, maxScore };
-}
-
-export async function POST(request: NextRequest) {
-  try {
-    const body = await request.json();
-    const { url: rawUrl } = body;
-
-    if (!rawUrl || typeof rawUrl !== "string") {
-      return NextResponse.json(
-        { error: "A valid URL is required" },
-        { status: 400 }
-      );
-    }
-
-    let parsedUrl: URL;
+  for (const { path, expected } of SENSITIVE_FILES) {
     try {
-      parsedUrl = normalizeUrl(rawUrl);
+      const s = await stat(path);
+      const mode = (s.mode & 0o777).toString(8);
+      const expectedNum = parseInt(expected, 8);
+      const actualNum = parseInt(mode, 8);
+      const isVulnerable = actualNum > expectedNum;
+
+      results.push({
+        path,
+        currentPermissions: mode,
+        expectedPermissions: expected,
+        isVulnerable,
+        reason: isVulnerable ? `Permissions ${mode} are more permissive than expected ${expected}` : undefined,
+      });
     } catch {
-      return NextResponse.json(
-        { error: "Invalid URL format" },
-        { status: 400 }
-      );
+      results.push({
+        path,
+        currentPermissions: "N/A",
+        expectedPermissions: expected,
+        isVulnerable: false,
+        reason: "File not accessible",
+      });
     }
+  }
 
-    const hostname = parsedUrl.hostname;
+  return results;
+}
 
-    const [headers, ssl, dnsResult] = await Promise.all([
-      checkHeaders(parsedUrl),
-      checkSSL(hostname),
-      checkDNS(hostname),
+function computeScore(
+  ports: OpenPort[],
+  ssh: SSHConfig,
+  firewall: FirewallConfig,
+  updates: SystemUpdate,
+  services: RunningService[],
+  files: FilePermission[]
+): { score: number; riskLevel: ScanRiskLevel } {
+  let score = 100;
+
+  score -= ports.filter((p) => p.riskLevel === ScanRiskLevel.High).length * 5;
+
+  if (ssh.passwordAuthEnabled) score -= 10;
+  if (ssh.rootLoginAllowed) score -= 15;
+  if (!ssh.keyBasedAuthAvailable) score -= 5;
+
+  if (!firewall.isActive) score -= 20;
+  else if (firewall.defaultPolicies.input === "ACCEPT" || firewall.defaultPolicies.input === "ALLOW")
+    score -= 10;
+
+  score -= Math.min(updates.upgradableCount * 2, 20);
+
+  score -= services.filter((s) => s.riskLevel === ScanRiskLevel.High).length * 5;
+
+  score -= files.filter((f) => f.isVulnerable).length * 10;
+
+  score = Math.max(0, score);
+
+  let riskLevel: ScanRiskLevel;
+  if (score >= 80) riskLevel = ScanRiskLevel.Low;
+  else if (score >= 60) riskLevel = ScanRiskLevel.Medium;
+  else if (score >= 40) riskLevel = ScanRiskLevel.High;
+  else riskLevel = ScanRiskLevel.Critical;
+
+  return { score, riskLevel };
+}
+
+export async function GET() {
+  try {
+    const [hostname, osInfo, kernel] = await Promise.all([
+      run("hostname"),
+      run("cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"'"),
+      run("uname -r"),
     ]);
 
-    const { grade, score, maxScore } = computeGrade(headers, ssl, dnsResult);
+    const [openPorts, sshConfig, firewallConfig, systemUpdates, runningServices, filePermissions] =
+      await Promise.all([
+        scanPorts(),
+        scanSSH(),
+        scanFirewall(),
+        scanUpdates(),
+        scanServices(),
+        scanFilePermissions(),
+      ]);
+
+    const { score, riskLevel } = computeScore(
+      openPorts,
+      sshConfig,
+      firewallConfig,
+      systemUpdates,
+      runningServices,
+      filePermissions
+    );
 
     const result: ScanResult = {
-      url: parsedUrl.toString(),
-      headers,
-      ssl,
-      dns: dnsResult,
-      grade,
-      score,
-      maxScore,
-      scannedAt: new Date().toISOString(),
+      hostname: hostname || "unknown",
+      os: osInfo || "Unknown OS",
+      kernel: kernel || "unknown",
+      scanDate: new Date().toISOString(),
+      categories: {
+        openPorts,
+        sshConfig,
+        firewallConfig,
+        systemUpdates,
+        runningServices,
+        filePermissions,
+      },
+      overallScore: score,
+      riskLevel,
     };
 
     return NextResponse.json(result);
   } catch {
-    return NextResponse.json(
-      { error: "Scan failed. Please try again." },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: "Scan failed" }, { status: 500 });
   }
 }
